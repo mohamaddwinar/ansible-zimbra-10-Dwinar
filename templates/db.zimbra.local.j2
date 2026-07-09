@@ -1,0 +1,14 @@
+$TTL 86400
+@       IN      SOA     ns1.{{ zimbra_domain }}. root.{{ zimbra_domain }}. (
+                        2026031001
+                        3600
+                        1800
+                        604800
+                        86400 )
+
+        IN      NS      ns1.{{ zimbra_domain }}.
+        IN      MX 10   {{ zimbra_fqdn }}.
+
+@       IN      A       {{ ansible_default_ipv4.address }}
+ns1     IN      A       {{ ansible_default_ipv4.address }}
+{{ zimbra_fqdn.split('.')[0] }}    IN      A       {{ ansible_default_ipv4.address }}

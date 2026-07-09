@@ -1,0 +1,725 @@
+---
+# =============================
+# Validation
+# =============================
+
+- name: validate required variables
+  ansible.builtin.assert:
+    that:
+      - zimbra_fqdn is defined
+      - zimbra_fqdn | length > 0
+      - zimbra_fqdn != 'mail.example.com'
+      - zimbra_domain is defined
+      - zimbra_domain | length > 0
+      - zimbra_domain != 'example.com'
+      - zimbra_admin_user is defined
+      - zimbra_admin_user | length > 0
+      - zimbra_admin_password is defined
+      - zimbra_admin_password | length > 0
+      - zimbra_timezone is defined
+      - zimbra_timezone | length > 0
+      - zimbra_dns_forwarders is defined
+      - zimbra_dns_forwarders | length > 0
+      - ansible_default_ipv4.interface is defined
+      - ansible_default_ipv4.address is defined
+      - ansible_default_ipv4.netmask is defined
+      - ansible_default_ipv4.network is defined
+      - ansible_default_ipv4.gateway is defined
+    fail_msg: "Variable/facts Zimbra belum lengkap. Pastikan host facts, DNS, dan variable Zimbra sudah terisi."
+
+- name: set Ubuntu 24 installer facts
+  ansible.builtin.set_fact:
+    zimbra_installer_url: "https://files.zimbra.com/downloads/10.1.0_GA/zcs-NETWORK-10.1.0_GA_4876.UBUNTU24_64.20260428124223.tgz"
+    zimbra_installer_archive: "/root/zimbra-ubuntu24.tgz"
+    zimbra_installer_dir: "/root/zcs-NETWORK-10.1.0_GA_4876.UBUNTU24_64.20260428124223"
+    zimbra_short_hostname: "{{ zimbra_fqdn.split('.')[0] }}"
+
+- name: set IPv4 prefix fact
+  ansible.builtin.set_fact:
+    zimbra_ipv4_prefix: "{{ (ansible_default_ipv4.network ~ '/' ~ ansible_default_ipv4.netmask) | ansible.utils.ipaddr('prefix') }}"
+
+- name: set resolver content fact
+  ansible.builtin.set_fact:
+    zimbra_upstream_resolv_conf: "search {{ zimbra_domain }}\n{% for dns in zimbra_dns_forwarders %}nameserver {{ dns }}\n{% endfor %}"
+    zimbra_netplan_dns_inline: "{{ zimbra_dns_forwarders | join(', ') }}"
+
+- name: gather package facts
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: gather service facts
+  ansible.builtin.service_facts:
+
+- name: check if Zimbra is already installed
+  ansible.builtin.stat:
+    path: /opt/zimbra/bin/zmcontrol
+  register: zimbra_installed
+
+- name: check existing phase 1 file before cleanup
+  ansible.builtin.stat:
+    path: /opt/zimbra/libexec/zmsetup.pl
+  register: zimbra_existing_phase1
+
+- name: remove partial Zimbra directory from failed phase 1
+  ansible.builtin.file:
+    path: /opt/zimbra
+    state: absent
+  when:
+    - not zimbra_installed.stat.exists
+    - not zimbra_existing_phase1.stat.exists
+
+- name: remove stale async and install logs from previous failed run
+  ansible.builtin.shell: |
+    rm -rf /root/.ansible_async/*
+    rm -f /tmp/install.log /tmp/zmsetup.log
+  changed_when: false
+  when: not zimbra_installed.stat.exists
+
+# =============================
+# Prevent apt lock issue
+# =============================
+
+- name: stop unattended upgrades during Zimbra install
+  ansible.builtin.service:
+    name: unattended-upgrades
+    state: stopped
+    enabled: false
+  failed_when: false
+
+- name: stop packagekit during Zimbra install
+  ansible.builtin.service:
+    name: packagekit
+    state: stopped
+    enabled: false
+  failed_when: false
+
+# Skip pkill here. systemctl stop above is enough; pkill -f can kill its own Ansible shell and return rc -15.
+
+- name: wait for apt dpkg lock to be released
+  ansible.builtin.shell: |
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+          fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+          fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
+      echo "Waiting for apt/dpkg lock..."
+      sleep 10
+    done
+  changed_when: false
+
+- name: repair dpkg state if needed
+  ansible.builtin.command: dpkg --configure -a
+  changed_when: false
+
+- name: repair apt dependencies if needed
+  ansible.builtin.command: apt-get -f install -y
+  changed_when: false
+
+# =============================
+# Fix Ubuntu apt mirror
+# =============================
+
+- name: backup apt sources
+  ansible.builtin.shell: |
+    set -e
+    mkdir -p /root/apt-source-backup
+    tar -czf /root/apt-source-backup/apt-sources-$(date +%F-%H%M%S).tgz \
+      /etc/apt/sources.list \
+      /etc/apt/sources.list.d 2>/dev/null || true
+  changed_when: false
+
+- name: replace broken Cloudeka mirror with Ubuntu official mirror
+  ansible.builtin.shell: |
+    set -e
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+      [ -f "$f" ] || continue
+      sed -i \
+        -e 's|http://cdn.repo.cloudeka.id/ubuntu|http://archive.ubuntu.com/ubuntu|g' \
+        -e 's|https://cdn.repo.cloudeka.id/ubuntu|http://archive.ubuntu.com/ubuntu|g' \
+        "$f"
+    done
+  changed_when: true
+
+- name: ensure Ubuntu official deb822 source exists
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/ubuntu-official.sources
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      Types: deb
+      URIs: http://archive.ubuntu.com/ubuntu
+      Suites: noble noble-updates noble-backports
+      Components: main restricted universe multiverse
+      Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+      Types: deb
+      URIs: http://security.ubuntu.com/ubuntu
+      Suites: noble-security
+      Components: main restricted universe multiverse
+      Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+- name: configure apt to prefer IPv4
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/99force-ipv4
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      Acquire::ForceIPv4 "true";
+
+- name: configure apt retry and timeout
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/80-retries-timeout
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      Acquire::Retries "5";
+      Acquire::http::Timeout "60";
+      Acquire::https::Timeout "60";
+
+- name: clean apt cache after mirror fix
+  ansible.builtin.shell: |
+    rm -rf /var/lib/apt/lists/*
+    apt-get clean
+  changed_when: false
+
+- name: update apt cache after mirror fix
+  ansible.builtin.apt:
+    update_cache: true
+    lock_timeout: 900
+
+# =============================
+# Network configuration
+# =============================
+
+- name: configure static networking with upstream DNS
+  ansible.builtin.copy:
+    dest: /etc/netplan/01-netcfg.yaml
+    owner: root
+    group: root
+    mode: '0600'
+    content: |
+      network:
+        version: 2
+        renderer: networkd
+        ethernets:
+          {{ ansible_default_ipv4.interface }}:
+            dhcp4: false
+            addresses:
+              - {{ ansible_default_ipv4.address }}/{{ zimbra_ipv4_prefix }}
+            routes:
+              - to: default
+                via: {{ ansible_default_ipv4.gateway }}
+            nameservers:
+              addresses: [{{ zimbra_netplan_dns_inline }}]
+  register: zimbra_netplan_config
+
+- name: apply netplan
+  ansible.builtin.command: netplan apply
+  async: 30
+  poll: 0
+  changed_when: true
+  when: zimbra_netplan_config.changed
+
+- name: wait for connection to recover after netplan apply
+  ansible.builtin.wait_for_connection:
+    delay: 5
+    timeout: 60
+
+# =============================
+# Pre-flight
+# =============================
+
+- name: verify internet connectivity
+  ansible.builtin.command: ping -c 2 8.8.8.8
+  changed_when: false
+
+- name: verify DNS resolution before local DNS switch
+  ansible.builtin.command: getent hosts files.zimbra.com
+  changed_when: false
+
+# =============================
+# Install dependencies
+# =============================
+
+- name: update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    lock_timeout: 900
+
+- name: install utilities and dependencies
+  ansible.builtin.apt:
+    name:
+      - bash-completion
+      - tmux
+      - telnet
+      - dnsutils
+      - tcpdump
+      - wget
+      - curl
+      - ca-certificates
+      - lsof
+      - rsync
+      - rsyslog
+      - tar
+      - netcat-openbsd
+      - chrony
+      - perl
+      - net-tools
+      - unzip
+      - sysstat
+      - bind9
+      - bind9utils
+      - bind9-host
+      - libidn12
+      - libaio1t64
+    state: present
+    update_cache: true
+    lock_timeout: 900
+
+- name: pre-download Ubuntu packages required by Zimbra installer
+  ansible.builtin.shell: |
+    apt-get install -y --download-only \
+      alsa-ucm-conf \
+      libbabeltrace1 \
+      libipt2 \
+      libsource-highlight-common \
+      libsource-highlight4t64
+  changed_when: false
+
+# =============================
+# Time configuration
+# =============================
+
+- name: disable systemd-timesyncd if installed
+  ansible.builtin.service:
+    name: systemd-timesyncd
+    state: stopped
+    enabled: false
+  failed_when: false
+
+- name: mask systemd-timesyncd if installed
+  ansible.builtin.command: systemctl mask systemd-timesyncd
+  failed_when: false
+  changed_when: false
+
+- name: enable chrony
+  ansible.builtin.service:
+    name: chrony
+    state: started
+    enabled: true
+
+- name: configure time zone
+  community.general.timezone:
+    name: "{{ zimbra_timezone }}"
+
+- name: enable ntp
+  ansible.builtin.command: timedatectl set-ntp true
+  changed_when: false
+
+- name: restart chrony
+  ansible.builtin.service:
+    name: chrony
+    state: restarted
+
+- name: enable rsyslog
+  ansible.builtin.service:
+    name: rsyslog
+    state: started
+    enabled: true
+
+# =============================
+# Host configuration
+# =============================
+
+- name: configure hostname
+  ansible.builtin.hostname:
+    name: "{{ zimbra_fqdn }}"
+
+- name: configure hosts file
+  ansible.builtin.copy:
+    dest: /etc/hosts
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      127.0.0.1 localhost.localdomain localhost
+      {{ ansible_default_ipv4.address }} {{ zimbra_fqdn }} {{ zimbra_short_hostname }}
+
+# =============================
+# Security / firewall
+# =============================
+
+- name: disable ufw
+  ansible.builtin.command: ufw disable
+  failed_when: false
+  changed_when: false
+
+- name: stop ufw if installed
+  ansible.builtin.service:
+    name: ufw
+    state: stopped
+    enabled: false
+  failed_when: false
+
+- name: mask ufw if installed
+  ansible.builtin.command: systemctl mask ufw
+  failed_when: false
+  changed_when: false
+
+- name: disable postfix if installed
+  ansible.builtin.service:
+    name: postfix
+    state: stopped
+    enabled: false
+  when: "'postfix' in ansible_facts.packages"
+  failed_when: false
+
+# =============================
+# Local DNS with BIND
+# =============================
+
+- name: stop systemd-resolved
+  ansible.builtin.service:
+    name: systemd-resolved
+    state: stopped
+    enabled: false
+  failed_when: false
+
+- name: mask systemd-resolved
+  ansible.builtin.command: systemctl mask systemd-resolved
+  failed_when: false
+  changed_when: false
+
+- name: configure resolv.conf with upstream DNS before BIND switch
+  ansible.builtin.copy:
+    dest: /etc/resolv.conf
+    owner: root
+    group: root
+    mode: '0644'
+    content: "{{ zimbra_upstream_resolv_conf }}"
+
+- name: configure named options
+  ansible.builtin.copy:
+    dest: /etc/bind/named.conf.options
+    owner: root
+    group: bind
+    mode: '0644'
+    content: |
+      options {
+        directory "/var/cache/bind";
+
+        listen-on { 127.0.0.1; {{ ansible_default_ipv4.address }}; };
+        listen-on-v6 { none; };
+
+        allow-query { localhost; {{ ansible_default_ipv4.network }}/{{ zimbra_ipv4_prefix }}; };
+        recursion yes;
+        allow-recursion { localhost; {{ ansible_default_ipv4.network }}/{{ zimbra_ipv4_prefix }}; };
+
+        forwarders { {{ zimbra_dns_forwarders | join('; ') }}; };
+
+        dnssec-validation no;
+        auth-nxdomain no;
+      };
+  register: zimbra_named_options
+
+- name: configure named local zone
+  ansible.builtin.copy:
+    dest: /etc/bind/named.conf.local
+    owner: root
+    group: bind
+    mode: '0644'
+    content: |
+      zone "{{ zimbra_domain }}" {
+        type master;
+        file "/var/cache/bind/db.{{ zimbra_domain }}";
+      };
+  register: zimbra_named_local
+
+- name: configure DNS zone file
+  ansible.builtin.template:
+    src: db.zimbra.local.j2
+    dest: "/var/cache/bind/db.{{ zimbra_domain }}"
+    owner: root
+    group: bind
+    mode: '0644'
+  register: zimbra_named_zone
+
+- name: validate named config
+  ansible.builtin.command: named-checkconf
+  changed_when: false
+
+- name: validate DNS zone file
+  ansible.builtin.command: named-checkzone {{ zimbra_domain }} /var/cache/bind/db.{{ zimbra_domain }}
+  changed_when: false
+
+- name: restart bind9
+  ansible.builtin.service:
+    name: bind9
+    state: restarted
+    enabled: true
+
+- name: configure resolv.conf to local BIND
+  ansible.builtin.copy:
+    dest: /etc/resolv.conf
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      search {{ zimbra_domain }}
+      nameserver 127.0.0.1
+
+- name: verify local DNS resolution for Zimbra hostname
+  ansible.builtin.command: getent hosts {{ zimbra_fqdn }}
+  changed_when: false
+
+- name: verify external DNS resolution after local DNS switch
+  ansible.builtin.command: getent hosts files.zimbra.com
+  changed_when: false
+
+# =============================
+# Download Zimbra
+# =============================
+
+- name: check existing Zimbra installer archive
+  ansible.builtin.stat:
+    path: "{{ zimbra_installer_archive }}"
+  register: zimbra_installer_archive_stat
+  when: not zimbra_installed.stat.exists
+
+- name: remove incomplete Zimbra installer archive
+  ansible.builtin.file:
+    path: "{{ zimbra_installer_archive }}"
+    state: absent
+  when:
+    - not zimbra_installed.stat.exists
+    - zimbra_installer_archive_stat.stat.exists | default(false)
+    - zimbra_installer_archive_stat.stat.size | default(0) | int < 100000000
+
+- name: download Zimbra installer with curl
+  ansible.builtin.shell: |
+    set -e
+    TMP_FILE="{{ zimbra_installer_archive }}.part"
+
+    rm -f "$TMP_FILE"
+
+    curl -fL \
+      --retry 5 \
+      --retry-delay 10 \
+      --connect-timeout 30 \
+      --output "$TMP_FILE" \
+      "{{ zimbra_installer_url }}"
+
+    mv "$TMP_FILE" "{{ zimbra_installer_archive }}"
+    chmod 0644 "{{ zimbra_installer_archive }}"
+  args:
+    creates: "{{ zimbra_installer_archive }}"
+  when: not zimbra_installed.stat.exists
+
+- name: verify Zimbra installer archive
+  ansible.builtin.command: tar -tzf {{ zimbra_installer_archive }}
+  changed_when: false
+  when: not zimbra_installed.stat.exists
+
+- name: extract Zimbra installer
+  ansible.builtin.unarchive:
+    src: "{{ zimbra_installer_archive }}"
+    dest: /root
+    remote_src: true
+    creates: "{{ zimbra_installer_dir }}"
+  when: not zimbra_installed.stat.exists
+
+# =============================
+# Prepare installer
+# =============================
+
+- name: configure answer file
+  ansible.builtin.template:
+    src: zimbra_answers.txt.j2
+    dest: /tmp/zimbra_answers.txt
+    mode: '0600'
+  when: not zimbra_installed.stat.exists
+
+- name: capture random chars 1
+  ansible.builtin.shell: "tr -dc 'A-Za-z0-9' </dev/urandom | head -c 9"
+  register: zimbra_random_chars_1
+  changed_when: false
+  when: not zimbra_installed.stat.exists
+
+- name: capture random chars 2
+  ansible.builtin.shell: "tr -dc 'A-Za-z0-9' </dev/urandom | head -c 14"
+  register: zimbra_random_chars_2
+  changed_when: false
+  when: not zimbra_installed.stat.exists
+
+- name: capture mailboxd memory
+  ansible.builtin.shell: "free -m | awk 'NR==2{print int($2*0.25)}'"
+  register: zimbra_mailboxd_memory
+  changed_when: false
+  when: not zimbra_installed.stat.exists
+
+- name: capture system memory
+  ansible.builtin.shell: "free -m | awk 'NR==2{print int($2)}'"
+  register: zimbra_system_memory
+  changed_when: false
+  when: not zimbra_installed.stat.exists
+
+- name: configure config file
+  ansible.builtin.template:
+    src: zimbra_config.txt.j2
+    dest: /tmp/zimbra_config.txt
+    mode: '0600'
+  when: not zimbra_installed.stat.exists
+
+# =============================
+# Install Zimbra
+# =============================
+
+- name: check if phase 1 is already completed
+  ansible.builtin.stat:
+    path: /opt/zimbra/libexec/zmsetup.pl
+  register: zimbra_phase1_done
+
+- name: check if phase 2 marker exists
+  ansible.builtin.stat:
+    path: /opt/zimbra/.ansible_zimbra_phase2_done
+  register: zimbra_phase2_done
+
+- name: start Zimbra installer phase 1
+  ansible.builtin.shell: |
+    ./install.sh --skip-activation-check -s < /tmp/zimbra_answers.txt > /tmp/install.log 2>&1
+  args:
+    chdir: "{{ zimbra_installer_dir }}"
+  async: 7200
+  poll: 0
+  register: zimbra_phase1_job
+  when:
+    - not zimbra_installed.stat.exists
+    - not zimbra_phase1_done.stat.exists
+
+- name: wait for Zimbra installer phase 1
+  ansible.builtin.async_status:
+    jid: "{{ zimbra_phase1_job.ansible_job_id }}"
+  register: zimbra_phase1_status
+  until: zimbra_phase1_status.finished
+  retries: 720
+  delay: 10
+  failed_when:
+    - zimbra_phase1_status.finished | default(0) | int == 1
+    - zimbra_phase1_status.rc is defined
+    - zimbra_phase1_status.rc not in [0, 141]
+  when:
+    - not zimbra_installed.stat.exists
+    - not zimbra_phase1_done.stat.exists
+
+- name: verify phase 1 result
+  ansible.builtin.stat:
+    path: /opt/zimbra/libexec/zmsetup.pl
+  register: zimbra_phase1_verify
+  when: not zimbra_installed.stat.exists
+
+- name: fail if phase 1 did not complete properly
+  ansible.builtin.fail:
+    msg: "Phase 1 installer gagal. Cek /tmp/install.log."
+  when:
+    - not zimbra_installed.stat.exists
+    - not zimbra_phase1_verify.stat.exists
+
+- name: start Zimbra installer phase 2
+  ansible.builtin.shell: |
+    /opt/zimbra/libexec/zmsetup.pl -c /tmp/zimbra_config.txt > /tmp/zmsetup.log 2>&1
+  async: 7200
+  poll: 0
+  register: zimbra_phase2_job
+  when:
+    - not zimbra_installed.stat.exists
+    - not zimbra_phase2_done.stat.exists
+
+- name: wait for Zimbra installer phase 2
+  ansible.builtin.async_status:
+    jid: "{{ zimbra_phase2_job.ansible_job_id }}"
+  register: zimbra_phase2_status
+  until: zimbra_phase2_status.finished
+  retries: 720
+  delay: 10
+  failed_when:
+    - zimbra_phase2_status.finished | default(0) | int == 1
+    - zimbra_phase2_status.rc is defined
+    - zimbra_phase2_status.rc != 0
+  when:
+    - not zimbra_installed.stat.exists
+    - not zimbra_phase2_done.stat.exists
+
+- name: verify phase 2 result
+  ansible.builtin.shell: test -x /opt/zimbra/bin/zmcontrol
+  register: zimbra_phase2_verify
+  changed_when: false
+  failed_when: zimbra_phase2_verify.rc != 0
+  when:
+    - not zimbra_installed.stat.exists
+    - not zimbra_phase2_done.stat.exists
+
+- name: create phase 2 marker
+  ansible.builtin.file:
+    path: /opt/zimbra/.ansible_zimbra_phase2_done
+    state: touch
+    mode: '0644'
+  when:
+    - not zimbra_installed.stat.exists
+    - not zimbra_phase2_done.stat.exists
+
+# =============================
+# Post install
+# =============================
+
+- name: set trusted IP
+  ansible.builtin.shell: ./zmprov mcf +zimbraMailTrustedIP 127.0.0.1 +zimbraMailTrustedIP "{{ ansible_default_ipv4.address }}"
+  args:
+    chdir: /opt/zimbra/bin
+  become: true
+  become_user: zimbra
+  become_flags: -i
+  register: zimbra_trusted_ip_result
+  failed_when: false
+  changed_when: true
+  when: zimbra_phase2_done.stat.exists or not zimbra_installed.stat.exists
+
+- name: restart Zimbra services
+  ansible.builtin.shell: ./zmcontrol restart
+  args:
+    chdir: /opt/zimbra/bin
+  become: true
+  become_user: zimbra
+  become_flags: -i
+  register: zimbra_restart_result
+  failed_when: false
+  changed_when: true
+  when: zimbra_phase2_done.stat.exists or not zimbra_installed.stat.exists
+
+- name: check Zimbra service status after restart
+  ansible.builtin.shell: ./zmcontrol status
+  args:
+    chdir: /opt/zimbra/bin
+  become: true
+  become_user: zimbra
+  become_flags: -i
+  register: zimbra_status_result
+  changed_when: false
+  failed_when: false
+  when: zimbra_phase2_done.stat.exists or not zimbra_installed.stat.exists
+
+- name: validate critical Zimbra services
+  ansible.builtin.assert:
+    that:
+      - "'ldap                    Running' in zimbra_status_result.stdout"
+      - "'mailbox                 Running' in zimbra_status_result.stdout"
+      - "'mta                     Running' in zimbra_status_result.stdout"
+      - "'proxy                   Running' in zimbra_status_result.stdout"
+      - "'logger                  Running' in zimbra_status_result.stdout"
+    fail_msg: "Ada service inti Zimbra yang belum Running setelah restart. Cek output zmcontrol status."
+  when: zimbra_phase2_done.stat.exists or not zimbra_installed.stat.exists
+
+- name: show Zimbra status after restart
+  ansible.builtin.debug:
+    var: zimbra_status_result.stdout_lines
+  when: zimbra_phase2_done.stat.exists or not zimbra_installed.stat.exists

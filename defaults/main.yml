@@ -1,5 +1,19 @@
 ---
-# defaults file for ansible-zimbra-single
-zimbra_fqdn: mail.example.com
-zimbra_timezone: Asia/Singapore
-zimbra_admin_password: ansible@zimbra2020
+# defaults file for ansible-zimbra
+
+# Host configuration
+zimbra_fqdn: zimbra10.dwinar.web.id
+zimbra_domain: dwinar.web.id
+zimbra_timezone: Asia/Jakarta
+
+# Zimbra version
+#zimbra_version: 10.1.0
+
+# Admin account
+zimbra_admin_user: admin
+zimbra_admin_password: rahasia
+
+# Upstream DNS for host networking and BIND forwarders
+zimbra_dns_forwarders:
+  - "8.8.8.8"
+  - "1.1.1.1"

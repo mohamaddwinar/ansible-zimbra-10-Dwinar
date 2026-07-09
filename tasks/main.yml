@@ -1,29 +1,100 @@
 ---
-# tasks file for ansible-zimbra-single
-- name: import centos.yml
-  import_tasks: centos.yml
-  when:
-    - ansible_distribution == "CentOS"
-    - ansible_distribution_major_version == "8"
-  tags: install
+# tasks file for ansible-zimbra
 
-- name: import ubuntu.yml
-  import_tasks: ubuntu.yml
+# ===============================
+# Rocky Linux
+# ===============================
+
+- name: Load Rocky Linux 8 tasks
+  ansible.builtin.include_tasks:
+    file: rocky8.yml
+    apply:
+      tags:
+        - install
+  when:
+    - ansible_distribution == "Rocky"
+    - ansible_distribution_major_version | int == 8
+  tags:
+    - always
+
+- name: Load Rocky Linux 9 tasks
+  ansible.builtin.include_tasks:
+    file: rocky9.yml
+    apply:
+      tags:
+        - install
+  when:
+    - ansible_distribution == "Rocky"
+    - ansible_distribution_major_version | int == 9
+  tags:
+    - always
+
+
+# ===============================
+# Ubuntu
+# ===============================
+
+- name: Load Ubuntu 18 tasks
+  ansible.builtin.include_tasks:
+    file: ubuntu18.yml
+    apply:
+      tags:
+        - install
   when:
     - ansible_distribution == "Ubuntu"
-    - ansible_distribution_version == "18.04"
-  tags: install
+    - ansible_distribution_major_version | int == 18
+  tags:
+    - always
 
-- name: import zimbra9-centos.yml
-  import_tasks: zimbra9-centos.yml
-  when:
-    - ansible_distribution == "CentOS"
-    - ansible_distribution_major_version == "8"
-  tags: zimbra9
-
-- name: import zimbra9-ubuntu.yml
-  import_tasks: zimbra9-ubuntu.yml
+- name: Load Ubuntu 20 tasks
+  ansible.builtin.include_tasks:
+    file: ubuntu20.yml
+    apply:
+      tags:
+        - install
   when:
     - ansible_distribution == "Ubuntu"
-    - ansible_distribution_version == "18.04"
-  tags: zimbra9
+    - ansible_distribution_major_version | int == 20
+  tags:
+    - always
+
+- name: Load Ubuntu 22 tasks
+  ansible.builtin.include_tasks:
+    file: ubuntu22.yml
+    apply:
+      tags:
+        - install
+  when:
+    - ansible_distribution == "Ubuntu"
+    - ansible_distribution_major_version | int == 22
+  tags:
+    - always
+
+- name: Load Ubuntu 24 tasks
+  ansible.builtin.include_tasks:
+    file: ubuntu24.yml
+    apply:
+      tags:
+        - install
+  when:
+    - ansible_distribution == "Ubuntu"
+    - ansible_distribution_major_version | int == 24
+  tags:
+    - always
+
+
+# ===============================
+# Unsupported OS / version protection
+# ===============================
+
+- name: Fail if OS or version is unsupported
+  ansible.builtin.fail:
+    msg: >
+      Unsupported OS: {{ ansible_distribution }} {{ ansible_distribution_version }}.
+      This role currently supports Rocky 8/9 and Ubuntu 18/20/22/24.
+  when: not (
+          (ansible_distribution == "Rocky" and (ansible_distribution_major_version | int) in [8, 9]) or
+          (ansible_distribution == "Ubuntu" and (ansible_distribution_major_version | int) in [18, 20, 22, 24])
+        )
+  tags:
+    - always

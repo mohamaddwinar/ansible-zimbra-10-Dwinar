@@ -1,11 +1,12 @@
 ---
-# handlers file for ansible-zimbra-single
-- name: restart dnsmasq
-  service:
-    name: dnsmasq
+# handlers file for ansible-zimbra
+
+- name: restart named
+  ansible.builtin.service:
+    name: named
     state: restarted
 
-- name: restart fail2ban
-  service:
-    name: fail2ban
+- name: restart chronyd
+  ansible.builtin.service:
+    name: chronyd
     state: restarted

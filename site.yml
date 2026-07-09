@@ -1,0 +1,5 @@
+---
+- hosts: zimbra
+  become: true
+  roles:
+    - ansible-zimbra
